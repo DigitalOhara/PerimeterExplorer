@@ -515,46 +515,69 @@ class PerimeterExplorer:
         except Exception as exc:
             warn(f"Wayback Machine error: {exc}")
 
-    def run_virustotal(self):
-        info("Querying VirusTotal...")
-        out_file = self._tmp("virustotal.txt")
-        subs = []
-        try:
-            if self.vt_api_key:
-                # Official API v3
-                headers = {"x-apikey": self.vt_api_key}
-                cursor  = None
-                while True:
-                    params = {"limit": 40}
-                    if cursor:
-                        params["cursor"] = cursor
-                    resp = requests.get(
-                        f"https://www.virustotal.com/api/v3/domains/{self.domain}/subdomains",
-                        headers=headers, params=params, timeout=30
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-                    for item in data.get("data", []):
-                        subs.append(item.get("id", ""))
-                    cursor = data.get("meta", {}).get("cursor")
-                    if not cursor or not data.get("data"):
-                        break
-                    time.sleep(0.5)   # be polite
-            else:
-                # Public UI endpoint (no key, limited results)
-                resp = requests.get(
-                    f"https://www.virustotal.com/ui/domains/{self.domain}/subdomains?limit=40",
-                    timeout=30,
-                    headers={"User-Agent": "PerimeterExplorer/1.0"}
+   def run_virustotal(self):
+    info("Querying VirusTotal...")
+    out_file = self._tmp("virustotal.txt")
+    subs = []
+    try:
+        if self.vt_api_key:
+            # Official API v3
+            headers = {"x-apikey": self.vt_api_key}
+            cursor = None
+            while True:
+                params = {"limit": 40}
+                if cursor:
+                    params["cursor"] = cursor
+                resp = self._vt_request(
+                    f"https://www.virustotal.com/api/v3/domains/{self.domain}/subdomains",
+                    headers=headers, params=params
                 )
-                resp.raise_for_status()
+                if resp is None:
+                    break
                 data = resp.json()
                 for item in data.get("data", []):
                     subs.append(item.get("id", ""))
-            out_file.write_text('\n'.join(subs))
-            self._record("virustotal", subs)
+                cursor = data.get("meta", {}).get("cursor")
+                if not cursor or not data.get("data"):
+                    break
+                time.sleep(15)  # VT free tier: 4 req/min
+        else:
+            # Public UI endpoint — single attempt, longer wait
+            resp = self._vt_request(
+                f"https://www.virustotal.com/ui/domains/{self.domain}/subdomains",
+                params={"limit": 40},
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36"}
+            )
+            if resp:
+                data = resp.json()
+                for item in data.get("data", []):
+                    subs.append(item.get("id", ""))
+
+        out_file.write_text('\n'.join(subs))
+        self._record("virustotal", subs)
+    except Exception as exc:
+        warn(f"VirusTotal error: {exc}")
+
+def _vt_request(self, url, headers=None, params=None, retries=3):
+    """Request with exponential backoff on 429."""
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=30)
+            if resp.status_code == 429:
+                wait = 60 * (attempt + 1)  # 60s, 120s, 180s
+                warn(f"VirusTotal rate limited. Waiting {wait}s (attempt {attempt+1}/{retries})...")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp
+        except requests.HTTPError as exc:
+            warn(f"VirusTotal HTTP error: {exc}")
+            return None
         except Exception as exc:
-            warn(f"VirusTotal error: {exc}")
+            warn(f"VirusTotal request error: {exc}")
+            return None
+    warn("VirusTotal: max retries reached, skipping.")
+    return None
 
     def run_dnsrecon(self):
         tool = "dnsrecon"
