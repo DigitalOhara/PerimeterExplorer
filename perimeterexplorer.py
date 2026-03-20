@@ -15,6 +15,12 @@ import csv
 import argparse
 import re
 import time
+import platform
+import stat
+import tarfile
+import zipfile
+import tempfile
+import shutil
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
@@ -53,6 +59,257 @@ BANNER = f"""{Fore.CYAN}
   {Fore.WHITE}github.com/DigitalOhara/PerimeterExplorer{Style.RESET_ALL}
   {"─" * 50}
 """
+
+# ─── Tool definitions & installation ──────────────────────────────────────────
+
+INSTALL_DIR = Path('/usr/local/bin')
+
+# Each tool entry:
+#   apt     → package name for apt-get (None = not in apt)
+#   go      → go install path (None = not a Go tool)
+#   github  → "owner/repo" for binary release download (None = skip)
+#   pip     → pip package name fallback (None = skip)
+TOOLS = {
+    'subfinder':   dict(apt=None,       go='github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest',
+                        github='projectdiscovery/subfinder', pip=None),
+    'assetfinder': dict(apt=None,       go='github.com/tomnomnom/assetfinder@latest',
+                        github='tomnomnom/assetfinder',      pip=None),
+    'findomain':   dict(apt=None,       go=None,
+                        github='Findomain/Findomain',        pip=None),
+    'amass':       dict(apt='amass',    go='github.com/owasp-amass/amass/v4/...@master',
+                        github='owasp-amass/amass',          pip=None),
+    'dnsrecon':    dict(apt='dnsrecon', go=None,
+                        github=None,                         pip='dnsrecon'),
+    'fierce':      dict(apt='fierce',   go=None,
+                        github=None,                         pip='fierce'),
+}
+
+
+def _sys_arch():
+    """Return (os_name, arch) suitable for matching GitHub release assets."""
+    machine = platform.machine().lower()
+    arch = 'amd64'
+    if machine in ('aarch64', 'arm64'):
+        arch = 'arm64'
+    elif machine.startswith('arm'):
+        arch = 'arm'
+    os_name = platform.system().lower()   # 'linux', 'darwin', 'windows'
+    return os_name, arch
+
+
+def _tool_installed(name):
+    return shutil.which(name) is not None
+
+
+def _run_silent(cmd, timeout=120):
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0, r.stdout + r.stderr
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _apt_install(package):
+    """Install a package via apt-get. Returns True on success."""
+    info(f"Installing {package} via apt-get...")
+    ok, out = _run_silent(
+        f"apt-get install -y {package}", timeout=300
+    )
+    if ok:
+        success(f"apt-get: {package} installed")
+    else:
+        warn(f"apt-get failed for {package}:\n{out.strip()}")
+    return ok
+
+
+def _go_install(pkg_path):
+    """Install a Go binary. Returns True on success."""
+    if not shutil.which('go'):
+        return False
+    name = pkg_path.split('/')[-1].split('@')[0]
+    info(f"Installing {name} via go install...")
+    ok, out = _run_silent(f"go install -v {pkg_path}", timeout=300)
+    if ok:
+        success(f"go install: {name} installed")
+    else:
+        warn(f"go install failed: {out.strip()}")
+    return ok
+
+
+def _pip_install(package):
+    """Install via pip. Returns True on success."""
+    info(f"Installing {package} via pip...")
+    ok, out = _run_silent(f"{sys.executable} -m pip install {package} -q", timeout=180)
+    if ok:
+        success(f"pip: {package} installed")
+    else:
+        warn(f"pip failed for {package}: {out.strip()}")
+    return ok
+
+
+def _github_binary_install(repo, tool_name):
+    """
+    Download the latest GitHub release binary for a tool.
+    Handles .zip and .tar.gz archives, and raw binaries.
+    Returns True on success.
+    """
+    os_name, arch = _sys_arch()
+    info(f"Fetching latest release for {tool_name} from github.com/{repo} ...")
+
+    try:
+        api_url = f"https://api.github.com/repos/{repo}/releases/latest"
+        resp = requests.get(api_url, timeout=15,
+                            headers={"User-Agent": "PerimeterExplorer/1.0"})
+        resp.raise_for_status()
+        assets = resp.json().get('assets', [])
+    except Exception as exc:
+        warn(f"Could not fetch GitHub releases for {repo}: {exc}")
+        return False
+
+    # Score assets by how well they match os+arch
+    def score(name):
+        name = name.lower()
+        s = 0
+        if os_name in name:   s += 2
+        if arch in name:      s += 2
+        # prefer archives over raw binaries when both exist
+        if name.endswith(('.zip', '.tar.gz', '.tgz')): s += 1
+        # penalise obviously wrong OS
+        for bad_os in ('windows', 'darwin', 'macos', 'linux'):
+            if bad_os != os_name and bad_os in name:
+                s -= 5
+        return s
+
+    assets = [a for a in assets if not a['name'].endswith(('.sha256', '.md5', '.txt', '.json'))]
+    assets.sort(key=lambda a: score(a['name']), reverse=True)
+
+    if not assets:
+        warn(f"No release assets found for {repo}")
+        return False
+
+    asset = assets[0]
+    asset_name = asset['name']
+    download_url = asset['browser_download_url']
+    info(f"Downloading {asset_name} ...")
+
+    try:
+        r = requests.get(download_url, timeout=120, stream=True,
+                         headers={"User-Agent": "PerimeterExplorer/1.0"})
+        r.raise_for_status()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            archive = tmp / asset_name
+            with open(archive, 'wb') as fh:
+                for chunk in r.iter_content(8192):
+                    fh.write(chunk)
+
+            # Extract
+            binary_path = None
+            if asset_name.endswith('.zip'):
+                with zipfile.ZipFile(archive) as zf:
+                    zf.extractall(tmp)
+            elif asset_name.endswith(('.tar.gz', '.tgz')):
+                with tarfile.open(archive) as tf:
+                    tf.extractall(tmp)
+
+            # Find the binary: first exact name match, then any executable
+            for candidate in [tool_name, tool_name.lower()]:
+                found = list(tmp.rglob(candidate))
+                if found:
+                    binary_path = found[0]
+                    break
+            if not binary_path:
+                # treat the downloaded file itself as the binary (raw binary asset)
+                binary_path = archive
+
+            dest = INSTALL_DIR / tool_name
+            shutil.copy2(binary_path, dest)
+            dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            success(f"Installed {tool_name} → {dest}")
+            return True
+    except Exception as exc:
+        warn(f"Binary download failed for {tool_name}: {exc}")
+        return False
+
+
+def check_and_install_tools(skip_install=False):
+    """
+    Check each required external tool. If missing and skip_install is False,
+    attempt installation via apt → go → github binary → pip (in that order).
+    """
+    print()
+    info("Checking required external tools...")
+    print(f"  {'Tool':<14} {'Status'}")
+    print(f"  {'─'*14} {'─'*20}")
+
+    missing = []
+    for tool in TOOLS:
+        installed = _tool_installed(tool)
+        status = f"{Fore.GREEN}installed{Style.RESET_ALL}" if installed else f"{Fore.RED}not found{Style.RESET_ALL}"
+        print(f"  {tool:<14} {status}")
+        if not installed:
+            missing.append(tool)
+
+    if not missing:
+        success("All tools are installed.")
+        print()
+        return
+
+    print()
+    if skip_install:
+        warn(f"Missing tools: {', '.join(missing)} — skipping install (--skip-install set)")
+        warn("Missing tools will be skipped during enumeration.")
+        print()
+        return
+
+    warn(f"{len(missing)} tool(s) not found: {', '.join(missing)}")
+    try:
+        answer = input(f"\n{Fore.CYAN}[?]{Style.RESET_ALL} Install missing tools now? [Y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = 'n'
+
+    if answer in ('n', 'no'):
+        warn("Skipping installation. Missing tools will be skipped during enumeration.")
+        print()
+        return
+
+    print()
+    # Update apt cache once before installing
+    info("Updating apt cache...")
+    _run_silent("apt-get update -qq", timeout=120)
+
+    for tool in missing:
+        cfg = TOOLS[tool]
+        installed = False
+
+        # 1. apt
+        if not installed and cfg['apt']:
+            installed = _apt_install(cfg['apt'])
+
+        # 2. go install
+        if not installed and cfg['go']:
+            installed = _go_install(cfg['go'])
+
+        # 3. GitHub binary release
+        if not installed and cfg['github']:
+            installed = _github_binary_install(cfg['github'], tool)
+
+        # 4. pip
+        if not installed and cfg['pip']:
+            installed = _pip_install(cfg['pip'])
+
+        if not installed:
+            warn(f"Could not install {tool} automatically. Install it manually.")
+
+    print()
+    # Final status
+    still_missing = [t for t in missing if not _tool_installed(t)]
+    if still_missing:
+        warn(f"Still missing: {', '.join(still_missing)} — these will be skipped during enumeration.")
+    else:
+        success("All missing tools installed successfully.")
+    print()
+
 
 # ─── Subdomain validation helper ──────────────────────────────────────────────
 
@@ -730,6 +987,12 @@ Examples:
         default=False,
         help="Skip active enumeration steps (amass active, fierce)"
     )
+    parser.add_argument(
+        "--skip-install",
+        action="store_true",
+        default=False,
+        help="Skip automatic tool installation check at startup"
+    )
     return parser.parse_args()
 
 
@@ -754,6 +1017,7 @@ def load_domains(args) -> list:
 def main():
     print(BANNER)
     args    = parse_args()
+    check_and_install_tools(skip_install=args.skip_install)
     domains = load_domains(args)
 
     base_output = Path(args.output)
