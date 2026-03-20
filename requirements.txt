@@ -1,0 +1,28 @@
+# ─── PerimeterExplorer — Python dependencies ──────────────────────────────────
+# Install with:  pip install -r requirements.txt
+#
+# NOTE: The tools below must be installed separately (they are NOT pip packages).
+#   subfinder   → go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+#   assetfinder → go install github.com/tomnomnom/assetfinder@latest
+#   findomain   → https://github.com/Findomain/Findomain/releases
+#   amass       → go install -v github.com/owasp-amass/amass/v4/...@master
+#   dnsrecon    → pip install dnsrecon   OR   apt install dnsrecon
+#   fierce      → pip install fierce
+#
+# ──────────────────────────────────────────────────────────────────────────────
+
+# HTTP client — used for crt.sh, Wayback Machine, VirusTotal API calls
+requests>=2.31.0
+
+# Cross-platform coloured terminal output
+colorama>=0.4.6
+
+# ─── Optional / recommended ───────────────────────────────────────────────────
+# DNS tools (used by dnsrecon under the hood; useful for manual validation too)
+dnspython>=2.4.0
+
+# dnsrecon — passive/active DNS reconnaissance
+dnsrecon>=1.1.4
+
+# fierce — DNS brute-force / subdomain scanner
+fierce>=1.5.0
