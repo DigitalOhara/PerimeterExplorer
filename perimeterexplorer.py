@@ -7,6 +7,8 @@ Combines multiple subdomain enumeration tools and APIs into a single workflow.
 Outputs results in .txt, .csv, and .html formats.
 """
 
+__version__ = "1.1.0"
+
 import os
 import sys
 import subprocess
