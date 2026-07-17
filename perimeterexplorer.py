@@ -1207,6 +1207,36 @@ Examples:
     return parser.parse_args()
 
 
+def show_api_sources(vt_key=None, st_key=None, shodan_key=None):
+    """Print a status table for all HTTP/API-based sources."""
+    info("API-based sources...")
+    print(f"  {'Source':<22} {'Status'}")
+    print(f"  {'─'*22} {'─'*28}")
+
+    free   = f"{Fore.GREEN}ready (free){Style.RESET_ALL}"
+    keyset = f"{Fore.GREEN}ready (API key set){Style.RESET_ALL}"
+    nok    = f"{Fore.YELLOW}limited (no key){Style.RESET_ALL}"
+    skip   = f"{Fore.YELLOW}skipped (no key){Style.RESET_ALL}"
+
+    sources = [
+        ("crt.sh",           free),
+        ("CertSpotter",      free),
+        ("Wayback Machine",  free),
+        ("HackerTarget",     free),
+        ("AlienVault OTX",   free),
+        ("RapidDNS",         free),
+        ("ThreatMiner",      free),
+        ("Anubis-DB",        free),
+        ("URLScan.io",       free),
+        ("VirusTotal",       keyset if vt_key  else nok),
+        ("SecurityTrails",   keyset if st_key  else skip),
+        ("Shodan",           keyset if shodan_key else skip),
+    ]
+    for name, status in sources:
+        print(f"  {name:<22} {status}")
+    print()
+
+
 def load_domains(args) -> list:
     if args.domain:
         return [args.domain.strip()]
@@ -1229,6 +1259,7 @@ def main():
     print(BANNER)
     args    = parse_args()
     check_and_install_tools(skip_install=args.skip_install)
+    show_api_sources(vt_key=args.vt_key, st_key=args.st_key, shodan_key=args.shodan_key)
     domains = load_domains(args)
 
     base_output = Path(args.output)
