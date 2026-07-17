@@ -343,12 +343,16 @@ def clean_subdomains(raw_list, domain):
 class PerimeterExplorer:
     def __init__(self, domain: str, output_dir: Path,
                  vt_api_key: str = None, wordlist: str = None,
-                 skip_active: bool = False):
-        self.domain       = domain.lower().strip()
-        self.output_dir   = output_dir
-        self.vt_api_key   = vt_api_key
-        self.wordlist     = wordlist
-        self.skip_active  = skip_active
+                 skip_active: bool = False,
+                 securitytrails_key: str = None,
+                 shodan_key: str = None):
+        self.domain              = domain.lower().strip()
+        self.output_dir          = output_dir
+        self.vt_api_key          = vt_api_key
+        self.wordlist            = wordlist
+        self.skip_active         = skip_active
+        self.securitytrails_key  = securitytrails_key
+        self.shodan_key          = shodan_key
         self.tool_results = {}      # {tool_name: [subdomain, ...]}
         self.all_subs     = set()
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -624,6 +628,169 @@ class PerimeterExplorer:
                 subs.append(m.group(1).rstrip('.'))
         self._record("fierce", subs)
 
+    def run_hackertarget(self):
+        info("Querying HackerTarget...")
+        subs = []
+        try:
+            resp = requests.get(
+                f"https://api.hackertarget.com/hostsearch/?q={self.domain}",
+                timeout=30, headers={"User-Agent": "PerimeterExplorer/1.0"}
+            )
+            resp.raise_for_status()
+            for line in resp.text.splitlines():
+                if ',' in line:
+                    subs.append(line.split(',')[0].strip())
+        except Exception as exc:
+            warn(f"HackerTarget error: {exc}")
+        self._record("hackertarget", subs)
+
+    def run_alienvault(self):
+        info("Querying AlienVault OTX...")
+        subs = []
+        page = 1
+        try:
+            while True:
+                resp = requests.get(
+                    f"https://otx.alienvault.com/api/v1/indicators/domain/{self.domain}/passive_dns",
+                    params={"limit": 500, "page": page},
+                    timeout=30, headers={"User-Agent": "PerimeterExplorer/1.0"}
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                records = data.get("passive_dns", [])
+                for r in records:
+                    h = r.get("hostname", "")
+                    if h:
+                        subs.append(h)
+                if not records or not data.get("has_next"):
+                    break
+                page += 1
+        except Exception as exc:
+            warn(f"AlienVault OTX error: {exc}")
+        self._record("alienvault", subs)
+
+    def run_rapiddns(self):
+        info("Querying RapidDNS...")
+        subs = []
+        try:
+            resp = requests.get(
+                f"https://rapiddns.io/subdomain/{self.domain}?full=1#result",
+                timeout=30, headers={"User-Agent": "Mozilla/5.0"}
+            )
+            resp.raise_for_status()
+            for match in re.findall(r'<td>([\w.\-]+\.' + re.escape(self.domain) + r')</td>', resp.text):
+                subs.append(match)
+        except Exception as exc:
+            warn(f"RapidDNS error: {exc}")
+        self._record("rapiddns", subs)
+
+    def run_threatminer(self):
+        info("Querying ThreatMiner...")
+        subs = []
+        try:
+            resp = requests.get(
+                f"https://api.threatminer.org/v2/domain.php",
+                params={"q": self.domain, "rt": "5"},
+                timeout=30, headers={"User-Agent": "PerimeterExplorer/1.0"}
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            subs = data.get("results", [])
+        except Exception as exc:
+            warn(f"ThreatMiner error: {exc}")
+        self._record("threatminer", subs)
+
+    def run_anubis(self):
+        info("Querying Anubis-DB...")
+        subs = []
+        try:
+            resp = requests.get(
+                f"https://jldc.me/anubis/subdomains/{self.domain}",
+                timeout=30, headers={"User-Agent": "PerimeterExplorer/1.0"}
+            )
+            resp.raise_for_status()
+            subs = resp.json()
+            if not isinstance(subs, list):
+                subs = []
+        except Exception as exc:
+            warn(f"Anubis-DB error: {exc}")
+        self._record("anubis", subs)
+
+    def run_urlscan(self):
+        info("Querying URLScan.io...")
+        subs = []
+        try:
+            resp = requests.get(
+                "https://urlscan.io/api/v1/search/",
+                params={"q": f"domain.{self.domain}", "size": 10000},
+                timeout=30, headers={"User-Agent": "PerimeterExplorer/1.0"}
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            for result in data.get("results", []):
+                h = result.get("page", {}).get("domain", "")
+                if h:
+                    subs.append(h)
+        except Exception as exc:
+            warn(f"URLScan.io error: {exc}")
+        self._record("urlscan", subs)
+
+    def run_certspotter(self):
+        info("Querying CertSpotter...")
+        subs = []
+        try:
+            resp = requests.get(
+                f"https://api.certspotter.com/v1/issuances",
+                params={"domain": self.domain, "include_subdomains": "true", "expand": "dns_names"},
+                timeout=30, headers={"User-Agent": "PerimeterExplorer/1.0"}
+            )
+            resp.raise_for_status()
+            for entry in resp.json():
+                for name in entry.get("dns_names", []):
+                    subs.append(name.lstrip("*."))
+        except Exception as exc:
+            warn(f"CertSpotter error: {exc}")
+        self._record("certspotter", subs)
+
+    def run_securitytrails(self):
+        if not self.securitytrails_key:
+            return
+        info("Querying SecurityTrails...")
+        subs = []
+        try:
+            headers = {"APIKEY": self.securitytrails_key, "User-Agent": "PerimeterExplorer/1.0"}
+            resp = requests.get(
+                f"https://api.securitytrails.com/v1/domain/{self.domain}/subdomains",
+                params={"children_only": "false", "include_inactive": "true"},
+                headers=headers, timeout=30
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            for sub in data.get("subdomains", []):
+                subs.append(f"{sub}.{self.domain}")
+        except Exception as exc:
+            warn(f"SecurityTrails error: {exc}")
+        self._record("securitytrails", subs)
+
+    def run_shodan(self):
+        if not self.shodan_key:
+            return
+        info("Querying Shodan DNS...")
+        subs = []
+        try:
+            resp = requests.get(
+                f"https://api.shodan.io/dns/domain/{self.domain}",
+                params={"key": self.shodan_key},
+                timeout=30, headers={"User-Agent": "PerimeterExplorer/1.0"}
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            for sub in data.get("subdomains", []):
+                subs.append(f"{sub}.{self.domain}")
+        except Exception as exc:
+            warn(f"Shodan error: {exc}")
+        self._record("shodan", subs)
+
     # ── run all ───────────────────────────────────────────────────────────────
 
     def run_all(self):
@@ -634,8 +801,17 @@ class PerimeterExplorer:
             self.run_amass_passive,
             self.run_amass_active,
             self.run_crtsh,
+            self.run_certspotter,
             self.run_wayback,
             self.run_virustotal,
+            self.run_hackertarget,
+            self.run_alienvault,
+            self.run_rapiddns,
+            self.run_threatminer,
+            self.run_anubis,
+            self.run_urlscan,
+            self.run_securitytrails,
+            self.run_shodan,
             self.run_dnsrecon,
             self.run_fierce,
         ]
@@ -1011,6 +1187,16 @@ Examples:
         help="Skip active enumeration steps (amass active, fierce)"
     )
     parser.add_argument(
+        "--st-key",
+        default=None,
+        help="SecurityTrails API key (enables SecurityTrails subdomain lookup)"
+    )
+    parser.add_argument(
+        "--shodan-key",
+        default=None,
+        help="Shodan API key (enables Shodan DNS subdomain lookup)"
+    )
+    parser.add_argument(
         "--skip-install",
         action="store_true",
         default=False,
@@ -1050,11 +1236,13 @@ def main():
     for domain in domains:
         out_dir = base_output / f"{domain}_{timestamp}"
         scanner = PerimeterExplorer(
-            domain      = domain,
-            output_dir  = out_dir,
-            vt_api_key  = args.vt_key,
-            wordlist    = args.wordlist,
-            skip_active = args.skip_active,
+            domain              = domain,
+            output_dir          = out_dir,
+            vt_api_key          = args.vt_key,
+            wordlist            = args.wordlist,
+            skip_active         = args.skip_active,
+            securitytrails_key  = args.st_key,
+            shodan_key          = args.shodan_key,
         )
         result = scanner.scan()
         total_found += len(scanner.all_subs)
