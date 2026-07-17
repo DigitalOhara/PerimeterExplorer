@@ -17,6 +17,7 @@ import csv
 import argparse
 import re
 import time
+import random
 import platform
 import stat
 import tarfile
@@ -392,6 +393,72 @@ class PerimeterExplorer:
         success(f"{tool_name}: {len(cleaned)} subdomains found")
         return cleaned
 
+    # ── human-like request helpers ────────────────────────────────────────────
+
+    _USER_AGENTS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    ]
+
+    def _human_delay(self, min_s=3, max_s=8):
+        """Sleep a random amount to avoid flooding APIs."""
+        delay = random.uniform(min_s, max_s)
+        time.sleep(delay)
+
+    def _http_get(self, url, params=None, extra_headers=None, timeout=60, retries=3):
+        """
+        Human-like GET with rotating UA, realistic browser headers,
+        random jitter between retries, and 429 back-off.
+        """
+        ua = random.choice(self._USER_AGENTS)
+        headers = {
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.7",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "DNT": "1",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+
+        for attempt in range(retries):
+            try:
+                resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+                if resp.status_code == 429:
+                    wait = random.uniform(30, 60) * (attempt + 1)
+                    warn(f"Rate limited by {url.split('/')[2]} — waiting {wait:.0f}s...")
+                    time.sleep(wait)
+                    continue
+                if resp.status_code == 503:
+                    wait = random.uniform(10, 20)
+                    warn(f"503 from {url.split('/')[2]} — waiting {wait:.0f}s...")
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                return resp
+            except requests.exceptions.Timeout:
+                if attempt < retries - 1:
+                    wait = random.uniform(5, 15)
+                    warn(f"Timeout on {url.split('/')[2]}, retrying in {wait:.0f}s ({attempt+2}/{retries})...")
+                    time.sleep(wait)
+                else:
+                    raise
+            except requests.exceptions.ConnectionError:
+                if attempt < retries - 1:
+                    wait = random.uniform(5, 15)
+                    warn(f"Connection error on {url.split('/')[2]}, retrying in {wait:.0f}s ({attempt+2}/{retries})...")
+                    time.sleep(wait)
+                else:
+                    raise
+        return None
+
     # ── tool runners ──────────────────────────────────────────────────────────
 
     def run_subfinder(self):
@@ -474,24 +541,13 @@ class PerimeterExplorer:
 
     def run_crtsh(self):
         info("Querying crt.sh (certificate transparency)...")
+        self._human_delay(2, 5)
         out_file = self._tmp("crtsh.txt")
         try:
-            resp = None
-            for attempt in range(3):
-                try:
-                    resp = requests.get(
-                        f"https://crt.sh/?q=%.{self.domain}&output=json",
-                        timeout=90,
-                        headers={"User-Agent": "PerimeterExplorer/1.0"}
-                    )
-                    resp.raise_for_status()
-                    break
-                except requests.exceptions.Timeout:
-                    if attempt < 2:
-                        warn(f"crt.sh timed out, retrying ({attempt + 2}/3)...")
-                        time.sleep(5)
-                    else:
-                        raise
+            resp = self._http_get(
+                f"https://crt.sh/?q=%.{self.domain}&output=json",
+                timeout=90, retries=3
+            )
             data = resp.json()
             subs = []
             for entry in data:
@@ -506,14 +562,14 @@ class PerimeterExplorer:
 
     def run_wayback(self):
         info("Querying Wayback Machine (web.archive.org)...")
+        self._human_delay(3, 7)
         out_file = self._tmp("wayback.txt")
         try:
             url = (
                 f"http://web.archive.org/cdx/search/cdx"
                 f"?url=*.{self.domain}/*&output=text&fl=original&collapse=urlkey"
             )
-            resp = requests.get(url, timeout=60,
-                                headers={"User-Agent": "PerimeterExplorer/1.0"})
+            resp = self._http_get(url, timeout=60)
             resp.raise_for_status()
             subs = []
             for line in resp.text.splitlines():
@@ -533,12 +589,12 @@ class PerimeterExplorer:
 
     def run_virustotal(self):
         info("Querying VirusTotal...")
+        self._human_delay(4, 9)
         out_file = self._tmp("virustotal.txt")
         subs = []
         try:
             if self.vt_api_key:
                 # Official API v3
-                headers = {"x-apikey": self.vt_api_key}
                 cursor = None
                 while True:
                     params = {"limit": 40}
@@ -546,7 +602,7 @@ class PerimeterExplorer:
                         params["cursor"] = cursor
                     resp = self._vt_request(
                         f"https://www.virustotal.com/api/v3/domains/{self.domain}/subdomains",
-                        headers=headers, params=params
+                        extra_headers={"x-apikey": self.vt_api_key}, params=params
                     )
                     if resp is None:
                         break
@@ -556,13 +612,12 @@ class PerimeterExplorer:
                     cursor = data.get("meta", {}).get("cursor")
                     if not cursor or not data.get("data"):
                         break
-                    time.sleep(15)  # VT free tier: 4 req/min
+                    time.sleep(random.uniform(15, 20))  # VT free tier: 4 req/min
             else:
-                # Public UI endpoint — single attempt, longer wait
+                # Public UI endpoint — single attempt
                 resp = self._vt_request(
                     f"https://www.virustotal.com/ui/domains/{self.domain}/subdomains",
-                    params={"limit": 40},
-                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36"}
+                    params={"limit": 40}
                 )
                 if resp:
                     data = resp.json()
@@ -574,24 +629,25 @@ class PerimeterExplorer:
         except Exception as exc:
             warn(f"VirusTotal error: {exc}")
 
-    def _vt_request(self, url, headers=None, params=None, retries=3):
-        """Request with exponential backoff on 429."""
+    def _vt_request(self, url, extra_headers=None, params=None, retries=3):
+        """VirusTotal request with exponential back-off on 429."""
         for attempt in range(retries):
             try:
-                resp = requests.get(url, headers=headers, params=params, timeout=30)
-                if resp.status_code == 429:
-                    wait = 60 * (attempt + 1)  # 60s, 120s, 180s
-                    warn(f"VirusTotal rate limited. Waiting {wait}s (attempt {attempt+1}/{retries})...")
-                    time.sleep(wait)
-                    continue
-                resp.raise_for_status()
+                resp = self._http_get(url, params=params, extra_headers=extra_headers, timeout=30, retries=1)
+                if resp is None:
+                    return None
                 return resp
             except requests.HTTPError as exc:
                 warn(f"VirusTotal HTTP error: {exc}")
                 return None
             except Exception as exc:
-                warn(f"VirusTotal request error: {exc}")
-                return None
+                if attempt < retries - 1:
+                    wait = random.uniform(60, 90) * (attempt + 1)
+                    warn(f"VirusTotal error, retrying in {wait:.0f}s: {exc}")
+                    time.sleep(wait)
+                else:
+                    warn(f"VirusTotal request error: {exc}")
+                    return None
         warn("VirusTotal: max retries reached, skipping.")
         return None
 
@@ -642,13 +698,13 @@ class PerimeterExplorer:
 
     def run_hackertarget(self):
         info("Querying HackerTarget...")
+        self._human_delay(3, 7)
         subs = []
         try:
-            resp = requests.get(
+            resp = self._http_get(
                 f"https://api.hackertarget.com/hostsearch/?q={self.domain}",
-                timeout=30, headers={"User-Agent": "PerimeterExplorer/1.0"}
+                timeout=45
             )
-            resp.raise_for_status()
             for line in resp.text.splitlines():
                 if ',' in line:
                     subs.append(line.split(',')[0].strip())
@@ -658,16 +714,16 @@ class PerimeterExplorer:
 
     def run_alienvault(self):
         info("Querying AlienVault OTX...")
+        self._human_delay(3, 7)
         subs = []
         page = 1
         try:
             while True:
-                resp = requests.get(
+                resp = self._http_get(
                     f"https://otx.alienvault.com/api/v1/indicators/domain/{self.domain}/passive_dns",
                     params={"limit": 500, "page": page},
-                    timeout=30, headers={"User-Agent": "PerimeterExplorer/1.0"}
+                    timeout=45
                 )
-                resp.raise_for_status()
                 data = resp.json()
                 records = data.get("passive_dns", [])
                 for r in records:
@@ -677,19 +733,20 @@ class PerimeterExplorer:
                 if not records or not data.get("has_next"):
                     break
                 page += 1
+                self._human_delay(4, 9)
         except Exception as exc:
             warn(f"AlienVault OTX error: {exc}")
         self._record("alienvault", subs)
 
     def run_rapiddns(self):
         info("Querying RapidDNS...")
+        self._human_delay(4, 9)
         subs = []
         try:
-            resp = requests.get(
+            resp = self._http_get(
                 f"https://rapiddns.io/subdomain/{self.domain}?full=1#result",
-                timeout=30, headers={"User-Agent": "Mozilla/5.0"}
+                timeout=45
             )
-            resp.raise_for_status()
             for match in re.findall(r'<td>([\w.\-]+\.' + re.escape(self.domain) + r')</td>', resp.text):
                 subs.append(match)
         except Exception as exc:
@@ -698,14 +755,14 @@ class PerimeterExplorer:
 
     def run_threatminer(self):
         info("Querying ThreatMiner...")
+        self._human_delay(3, 7)
         subs = []
         try:
-            resp = requests.get(
-                f"https://api.threatminer.org/v2/domain.php",
+            resp = self._http_get(
+                "https://api.threatminer.org/v2/domain.php",
                 params={"q": self.domain, "rt": "5"},
-                timeout=30, headers={"User-Agent": "PerimeterExplorer/1.0"}
+                timeout=45
             )
-            resp.raise_for_status()
             data = resp.json()
             subs = data.get("results", [])
         except Exception as exc:
@@ -714,13 +771,13 @@ class PerimeterExplorer:
 
     def run_anubis(self):
         info("Querying Anubis-DB...")
+        self._human_delay(3, 6)
         subs = []
         try:
-            resp = requests.get(
+            resp = self._http_get(
                 f"https://jldc.me/anubis/subdomains/{self.domain}",
-                timeout=30, headers={"User-Agent": "PerimeterExplorer/1.0"}
+                timeout=45
             )
-            resp.raise_for_status()
             subs = resp.json()
             if not isinstance(subs, list):
                 subs = []
@@ -730,14 +787,14 @@ class PerimeterExplorer:
 
     def run_urlscan(self):
         info("Querying URLScan.io...")
+        self._human_delay(4, 8)
         subs = []
         try:
-            resp = requests.get(
+            resp = self._http_get(
                 "https://urlscan.io/api/v1/search/",
                 params={"q": f"domain.{self.domain}", "size": 10000},
-                timeout=30, headers={"User-Agent": "PerimeterExplorer/1.0"}
+                timeout=60
             )
-            resp.raise_for_status()
             data = resp.json()
             for result in data.get("results", []):
                 h = result.get("page", {}).get("domain", "")
@@ -749,14 +806,14 @@ class PerimeterExplorer:
 
     def run_certspotter(self):
         info("Querying CertSpotter...")
+        self._human_delay(3, 6)
         subs = []
         try:
-            resp = requests.get(
-                f"https://api.certspotter.com/v1/issuances",
+            resp = self._http_get(
+                "https://api.certspotter.com/v1/issuances",
                 params={"domain": self.domain, "include_subdomains": "true", "expand": "dns_names"},
-                timeout=30, headers={"User-Agent": "PerimeterExplorer/1.0"}
+                timeout=45
             )
-            resp.raise_for_status()
             for entry in resp.json():
                 for name in entry.get("dns_names", []):
                     subs.append(name.lstrip("*."))
@@ -768,15 +825,15 @@ class PerimeterExplorer:
         if not self.securitytrails_key:
             return
         info("Querying SecurityTrails...")
+        self._human_delay(4, 8)
         subs = []
         try:
-            headers = {"APIKEY": self.securitytrails_key, "User-Agent": "PerimeterExplorer/1.0"}
-            resp = requests.get(
+            resp = self._http_get(
                 f"https://api.securitytrails.com/v1/domain/{self.domain}/subdomains",
                 params={"children_only": "false", "include_inactive": "true"},
-                headers=headers, timeout=30
+                extra_headers={"APIKEY": self.securitytrails_key},
+                timeout=45
             )
-            resp.raise_for_status()
             data = resp.json()
             for sub in data.get("subdomains", []):
                 subs.append(f"{sub}.{self.domain}")
@@ -788,14 +845,14 @@ class PerimeterExplorer:
         if not self.shodan_key:
             return
         info("Querying Shodan DNS...")
+        self._human_delay(4, 8)
         subs = []
         try:
-            resp = requests.get(
+            resp = self._http_get(
                 f"https://api.shodan.io/dns/domain/{self.domain}",
                 params={"key": self.shodan_key},
-                timeout=30, headers={"User-Agent": "PerimeterExplorer/1.0"}
+                timeout=45
             )
-            resp.raise_for_status()
             data = resp.json()
             for sub in data.get("subdomains", []):
                 subs.append(f"{sub}.{self.domain}")
@@ -827,11 +884,13 @@ class PerimeterExplorer:
             self.run_dnsrecon,
             self.run_fierce,
         ]
-        for runner in runners:
+        for i, runner in enumerate(runners):
             try:
                 runner()
             except Exception as exc:
                 error(f"Unexpected error in {runner.__name__}: {exc}")
+            if i < len(runners) - 1:
+                self._human_delay(2, 6)
 
     # ── output generation ─────────────────────────────────────────────────────
 
