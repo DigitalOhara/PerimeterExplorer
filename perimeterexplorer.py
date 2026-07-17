@@ -476,12 +476,22 @@ class PerimeterExplorer:
         info("Querying crt.sh (certificate transparency)...")
         out_file = self._tmp("crtsh.txt")
         try:
-            resp = requests.get(
-                f"https://crt.sh/?q=%.{self.domain}&output=json",
-                timeout=30,
-                headers={"User-Agent": "PerimeterExplorer/1.0"}
-            )
-            resp.raise_for_status()
+            resp = None
+            for attempt in range(3):
+                try:
+                    resp = requests.get(
+                        f"https://crt.sh/?q=%.{self.domain}&output=json",
+                        timeout=90,
+                        headers={"User-Agent": "PerimeterExplorer/1.0"}
+                    )
+                    resp.raise_for_status()
+                    break
+                except requests.exceptions.Timeout:
+                    if attempt < 2:
+                        warn(f"crt.sh timed out, retrying ({attempt + 2}/3)...")
+                        time.sleep(5)
+                    else:
+                        raise
             data = resp.json()
             subs = []
             for entry in data:
