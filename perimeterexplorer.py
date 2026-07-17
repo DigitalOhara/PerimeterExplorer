@@ -395,7 +395,8 @@ class PerimeterExplorer:
 
     # ── human-like request helpers ────────────────────────────────────────────
 
-    _USER_AGENTS = [
+    # Used only for HTML scraping targets (e.g. RapidDNS) where a browser UA is expected
+    _BROWSER_USER_AGENTS = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -406,25 +407,37 @@ class PerimeterExplorer:
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     ]
 
+    _TOOL_UA = f"PerimeterExplorer/{__version__} (github.com/DigitalOhara/PerimeterExplorer)"
+
     def _human_delay(self, min_s=3, max_s=8):
         """Sleep a random amount to avoid flooding APIs."""
-        delay = random.uniform(min_s, max_s)
-        time.sleep(delay)
+        time.sleep(random.uniform(min_s, max_s))
 
-    def _http_get(self, url, params=None, extra_headers=None, timeout=60, retries=3):
+    def _http_get(self, url, params=None, extra_headers=None, timeout=60,
+                  retries=3, scrape=False):
         """
-        Human-like GET with rotating UA, realistic browser headers,
-        random jitter between retries, and 429 back-off.
+        Paced GET with back-off and retry logic.
+
+        scrape=False (default): uses a descriptive tool UA — correct for JSON
+          APIs which identify clients by key/IP, not browser string.
+        scrape=True: rotates real browser UAs and adds browser-like Accept
+          headers — for HTML scraping targets that expect a browser.
         """
-        ua = random.choice(self._USER_AGENTS)
-        headers = {
-            "User-Agent": ua,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.7",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "DNT": "1",
-        }
+        if scrape:
+            ua = random.choice(self._BROWSER_USER_AGENTS)
+            headers = {
+                "User-Agent": ua,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.7",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+            }
+        else:
+            headers = {
+                "User-Agent": self._TOOL_UA,
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip, deflate",
+            }
         if extra_headers:
             headers.update(extra_headers)
 
@@ -745,7 +758,7 @@ class PerimeterExplorer:
         try:
             resp = self._http_get(
                 f"https://rapiddns.io/subdomain/{self.domain}?full=1#result",
-                timeout=45
+                timeout=45, scrape=True
             )
             for match in re.findall(r'<td>([\w.\-]+\.' + re.escape(self.domain) + r')</td>', resp.text):
                 subs.append(match)
