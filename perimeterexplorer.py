@@ -442,7 +442,7 @@ class PerimeterExplorer:
                     time.sleep(wait)
                 else:
                     raise
-        return None
+        raise RuntimeError(f"Max retries ({retries}) exhausted for {url.split('/')[2]} — skipping")
 
     # ── tool runners ──────────────────────────────────────────────────────────
 
@@ -760,7 +760,7 @@ class PerimeterExplorer:
         subs = []
         try:
             resp = self._http_get(
-                f"https://jldc.me/anubis/subdomains/{self.domain}",
+                f"https://jonlu.ca/anubis/subdomains/{self.domain}",
                 timeout=45
             )
             subs = resp.json()
